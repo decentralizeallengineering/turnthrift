@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""enum: survey a codebase in one call instead of many.
+
+  enum map [DIR]                    tree, biggest files, languages, recent commits, entry points
+  enum find TERM [TERM ...]         hits for several terms, definitions first, plus importers
+  enum around FILE:LINE             enclosing function or class, its callers, its tests
+
+Common options: --path DIR narrows the search, --max-lines N caps the output
+(default 200). Skips .git, node_modules, .venv and binary files. Read only,
+standard library only.
+"""
+import argparse
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
+             ".pytest_cache", ".ruff_cache", ".hg", ".svn", "dist", "build", ".idea"}
+BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".pdf", ".zip", ".gz", ".tgz",
+              ".bz2", ".xz", ".7z", ".tar", ".jar", ".whl", ".so", ".dll", ".dylib", ".exe", ".bin",
+              ".o", ".a", ".pyc", ".class", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".mov",
+              ".avi", ".sqlite", ".db", ".lock", ".min.js", ".map"}
+MAX_FILE_BYTES = 1_000_000
+HINT = "hint: narrow with --path or --max-lines"
+DEFAULT_MAX = 200
+ENTRY_NAMES = {"main", "cli", "__main__", "app", "manage", "index"}
+
+
+def walk(root):
+    """Yield (path, size) for candidate files under root, pruning skipped dirs."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in sorted(filenames):
+            if os.path.splitext(name)[1].lower() in BINARY_EXT:
+                continue
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if os.path.isfile(p):
+                yield p, st.st_size
+
+
+def read_text(path, size=None):
+    """Return decoded text, or None for binary, huge or unreadable files."""
+    try:
+        if size is not None and size > MAX_FILE_BYTES:
+            return None
+        with open(path, "rb") as f:
+            data = f.read(MAX_FILE_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_FILE_BYTES or b"\0" in data[:8000]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def rel(path, base):
+    return os.path.relpath(path, base)
+
+
+def finish(lines, max_lines):
+    """Print at most max_lines lines, always ending with the narrowing hint."""
+    room = max(1, max_lines - 1)
+    if len(lines) > room:
+        cut = len(lines) - (room - 1)
+        lines = lines[:room - 1] + ["[... %d lines omitted ...]" % cut]
+    lines.append(HINT)
+    print("\n".join(lines))
+    return 0
+
+
+def git(args, cwd):
+    try:
+        r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+# ---------------------------------------------------------------- map
+
+def cmd_map(a):
+    root = os.path.abspath(a.dir)
+    files = list(walk(root))
+    out = ["== tree (depth 2, file counts) =="]
+    counts = Counter()
+    for p, _ in files:
+        parts = rel(p, root).split(os.sep)
+        counts["."] += 1
+        for depth in (1, 2):
+            if len(parts) > depth:
+                counts[os.sep.join(parts[:depth])] += 1
+    out.append("./ (%d files)" % counts["."])
+    for key in sorted(k for k in counts if k != "."):
+        depth = key.count(os.sep)
+        out.append("%s%s/ (%d)" % ("  " * (depth + 1), os.path.basename(key), counts[key]))
+    top = sorted(files, key=lambda x: -x[1])[:10]
+    out.append("== 10 largest files ==")
+    out += ["%9d  %s" % (s, rel(p, root)) for p, s in top]
+    ext = Counter(os.path.splitext(p)[1].lower() or "(none)" for p, _ in files)
+    out.append("== languages by extension ==")
+    out.append(", ".join("%s %d" % kv for kv in ext.most_common(12)) or "(none)")
+    out.append("== 10 most recent commits ==")
+    log = git(["log", "-10", "--format=%h %ad %s", "--date=short"], root).strip()
+    out += log.splitlines() if log else ["(no git history)"]
+    out.append("== entry points ==")
+    entries = []
+    for p, _ in files:
+        base = os.path.basename(p)
+        stem = os.path.splitext(base)[0].lower()
+        r = rel(p, root)
+        if stem in ENTRY_NAMES and r.count(os.sep) <= 3:
+            entries.append(r)
+        elif base == "package.json":
+            text = read_text(p) or ""
+            try:
+                scripts = json.loads(text).get("scripts", {})
+            except (ValueError, AttributeError):
+                scripts = {}
+            for k, v in scripts.items():
+                entries.append("%s script %s: %s" % (r, k, v))
+        elif base in ("Makefile", "makefile", "GNUmakefile"):
+            text = read_text(p) or ""
+            targets = re.findall(r"^([A-Za-z0-9_.-]+)\s*:(?!=)", text, re.M)
+            entries.append("%s targets: %s" % (r, " ".join(t for t in targets if not t.startswith("."))))
+    out += entries or ["(none found)"]
+    return finish(out, a.max_lines)
+
+
+# ---------------------------------------------------------------- find
+
+def def_regex(term):
+    t = re.escape(term)
+    return re.compile(r"^\s*(?:(?:export|public|private|static|async|pub)\s+)*"
+                      r"(?:(?:def|class|function|func|fn|interface|struct|enum|trait|type)\s+%s\b"
+                      r"|(?:const|let|var|val)\s+%s\s*[:=])" % (t, t))
+
+
+def module_names(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem in ("__init__", "index"):
+        stem = os.path.basename(os.path.dirname(os.path.abspath(path))) or stem
+    return stem
+
+
+def import_regex(mod):
+    m = re.escape(mod)
+    return re.compile(r"^\s*(?:from\s+[\w.]*\b%s\b|import\s+[\w., ]*\b%s\b|.*\brequire\(.*\b%s\b"
+                      r"|.*\bfrom\s+['\"][^'\"]*\b%s\b|use\s+[\w:]*\b%s\b|#include\s+[\"<][^\">]*\b%s\b)" % ((m,) * 6))
+
+
+def cmd_find(a):
+    base = os.getcwd()
+    root = os.path.abspath(a.path)
+    flags = re.I if a.ignore_case else 0
+    pats = [re.compile(re.escape(t), flags) for t in a.terms]
+    defs = [def_regex(t) for t in a.terms]
+    needles = [t.lower() if a.ignore_case else t for t in a.terms]
+    per_file = {}      # path -> list of line numbers
+    texts = {}
+    definitions = []   # (path, lineno, text)
+    for p, size in walk(root):
+        text = read_text(p, size)
+        if text is None:
+            continue
+        hay = text.lower() if a.ignore_case else text
+        if not any(n in hay for n in needles):
+            continue
+        lines = text.splitlines()
+        hits = [i for i, l in enumerate(lines, 1) if any(pt.search(l) for pt in pats)]
+        if not hits:
+            continue
+        per_file[p] = hits
+        texts[p] = lines
+        for i in hits:
+            if any(d.match(lines[i - 1]) for d in defs):
+                definitions.append((p, i, lines[i - 1].strip()))
+    out = ["== definitions =="]
+    if definitions:
+        out += ["%s:%d: %s" % (rel(p, base), i, t) for p, i, t in definitions[:a.per_file * 4]]
+    else:
+        out.append("(none)")
+    out.append("== importers of defining modules ==")
+    def_files = sorted({p for p, _, _ in definitions})
+    importers = []
+    if def_files:
+        mods = {module_names(p): p for p in def_files}
+        regs = {m: import_regex(m) for m in mods}
+        for p, size in walk(root):
+            if p in mods.values():
+                continue
+            text = read_text(p, size)
+            if text is None or not any(m in text for m in mods):
+                continue
+            for m, rg in regs.items():
+                for i, l in enumerate(text.splitlines(), 1):
+                    if rg.match(l):
+                        importers.append("%s:%d: %s  [imports %s]" % (rel(p, base), i, l.strip(), m))
+                        break
+    out += importers or ["(none)"]
+    out.append("== hits by file (definition files first, %d per file) ==" % a.per_file)
+    order = sorted(per_file, key=lambda p: (p not in def_files, -len(per_file[p]), p))
+    for p in order:
+        lines = texts[p]
+        hits = per_file[p]
+        out.append("-- %s (%d hits)" % (rel(p, base), len(hits)))
+        shown, last_end = 0, 0
+        for i in hits:
+            if shown >= a.per_file:
+                out.append("   [... %d more hits in this file ...]" % (len(hits) - shown))
+                break
+            lo, hi = max(1, i - 2), min(len(lines), i + 2)
+            lo = max(lo, last_end + 1)
+            for n in range(lo, hi + 1):
+                out.append("%d%s%s" % (n, ":" if n == i else "-", lines[n - 1]))
+            last_end = hi
+            shown += 1
+    if not per_file:
+        out.append("(no hits)")
+    return finish(out, a.max_lines)
+
+
+# ---------------------------------------------------------------- around
+
+CODE_DEF = re.compile(r"^(\s*)(?:(?:export|public|private|protected|static|async|pub|default)\s+)*"
+                      r"(?:(?:def|class|function|func|fn|interface|struct|trait)\s+(\w+)"
+                      r"|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>)")
+
+
+def enclosing_python(text, line):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            if start <= line <= end and (best is None or start >= best[0]):
+                best = (start, end, node.name)
+    return best
+
+
+def enclosing_generic(lines, line):
+    for i in range(min(line, len(lines)), 0, -1):
+        m = CODE_DEF.match(lines[i - 1])
+        if not m:
+            continue
+        indent = len(m.group(1).expandtabs(4))
+        end = i
+        braces = 0
+        seen = False
+        for j in range(i, len(lines) + 1):
+            l = lines[j - 1]
+            braces += l.count("{") - l.count("}")
+            seen = seen or "{" in l
+            end = j
+            if seen and braces <= 0:
+                break
+            if not seen and j > i and l.strip() and len(l) - len(l.lstrip()) <= indent and not l.lstrip().startswith(("}", ")", "]")):
+                end = j - 1
+                break
+        if i <= line <= end or end >= line:
+            return i, end, m.group(2) or m.group(3)
+    return None
+
+
+def cmd_around(a):
+    base = os.getcwd()
+    spec = a.target
+    path, _, num = spec.rpartition(":")
+    if not path or not num.isdigit():
+        print("enum around: expected FILE:LINE, got %r" % spec, file=sys.stderr)
+        return 2
+    line = int(num)
+    text = read_text(path)
+    if text is None:
+        print("enum around: cannot read %s" % path, file=sys.stderr)
+        return 2
+    lines = text.splitlines()
+    found = enclosing_python(text, line) if path.endswith(".py") else None
+    found = found or enclosing_generic(lines, line)
+    out = []
+    if not found:
+        out.append("no enclosing function or class at %s:%d" % (path, line))
+        return finish(out, a.max_lines)
+    start, end, name = found
+    out.append("== %s %s:%d-%d ==" % (name, rel(os.path.abspath(path), base), start, end))
+    out += ["%d\t%s" % (n, lines[n - 1]) for n in range(start, end + 1)]
+    root = os.path.abspath(a.path)
+    call = re.compile(r"\b%s\b" % re.escape(name))
+    defline = def_regex(name)
+    callers, tests = [], []
+    me = os.path.abspath(path)
+    for p, size in walk(root):
+        t = read_text(p, size)
+        if t is None or name not in t:
+            continue
+        r = rel(p, base)
+        parts = set(r.split(os.sep)[:-1])
+        fname = os.path.basename(p)
+        is_test = bool(parts & {"tests", "test", "__tests__"}) or fname.startswith("test_") or ".test." in fname or fname.endswith("_test.py")
+        for i, l in enumerate(t.splitlines(), 1):
+            if not call.search(l) or defline.match(l):
+                continue
+            if os.path.abspath(p) == me and start <= i <= end:
+                continue
+            (tests if is_test else callers).append("%s:%d: %s" % (r, i, l.strip()))
+    out.append("== callers of %s ==" % name)
+    out += callers or ["(none)"]
+    out.append("== tests mentioning %s ==" % name)
+    out += tests or ["(none)"]
+    return finish(out, a.max_lines)
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="enum", description="Survey a codebase in one call.")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    def common(p):
+        p.add_argument("--max-lines", type=int, default=DEFAULT_MAX, help="cap on output lines (default %(default)d)")
+
+    m = sub.add_parser("map", help="tree, largest files, languages, commits, entry points")
+    m.add_argument("dir", nargs="?", default=".")
+    common(m)
+    f = sub.add_parser("find", help="grep several terms, definitions first, plus importers")
+    f.add_argument("terms", nargs="+")
+    f.add_argument("--path", default=".", help="directory to search (default .)")
+    f.add_argument("--per-file", type=int, default=5, help="hits shown per file (default %(default)d)")
+    f.add_argument("-i", "--ignore-case", action="store_true")
+    common(f)
+    r = sub.add_parser("around", help="enclosing function or class, callers, tests")
+    r.add_argument("target", metavar="FILE:LINE")
+    r.add_argument("--path", default=".", help="directory to search for callers (default .)")
+    common(r)
+    a = ap.parse_args(argv)
+    return {"map": cmd_map, "find": cmd_find, "around": cmd_around}[a.mode](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
