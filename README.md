@@ -1,5 +1,7 @@
 # turnthrift
 
+[![tests](https://github.com/decentralizeallengineering/turnthrift/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/turnthrift/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 Small Claude Code tools that cut model round trips and reply length, so a session uses less of your quota. Each tool call and each long reply costs tokens; these tools batch the first and nudge against the second. Python standard library only, no network, no model.
 
 - `burst`: runs many read-only commands and file excerpts in parallel in one shell call.
