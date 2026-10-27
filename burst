@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""burst: run many read-only commands or file excerpts in parallel, one shell call.
+
+  burst [-t SECS] [-H HEAD] [-T TAIL] [-j JOBS] [-f FILE] [CMD ...]
+  burst [CMD ...] --files PATH[:START-END[,START-END]] ...
+
+Commands and file excerpts can be mixed in one call; put --files last because
+it takes every remaining argument as a path.
+
+Every item gets its own timeout and an output cap (first HEAD and last TAIL
+lines). Results print in input order under `== item ==` headers. A line in a
+command file may start with `@SECS ` to override the timeout for that item.
+burst does not sandbox anything: pass only commands that do not modify state.
+"""
+import argparse
+import concurrent.futures
+import os
+import signal
+import subprocess
+import sys
+
+DEFAULT_TIMEOUT = float(os.environ.get("BURST_TIMEOUT", "20"))
+DEFAULT_HEAD = int(os.environ.get("BURST_HEAD", "40"))
+DEFAULT_TAIL = int(os.environ.get("BURST_TAIL", "10"))
+
+
+def cap(text, head, tail):
+    """Keep the first `head` and last `tail` lines; say how many were dropped."""
+    lines = text.splitlines()
+    if len(lines) <= head + tail:
+        return "\n".join(lines)
+    cut = len(lines) - head - tail
+    keep = lines[:head] + ["[... %d lines omitted ...]" % cut] + (lines[-tail:] if tail else [])
+    return "\n".join(keep)
+
+
+def run_command(cmd, timeout):
+    """Run a shell command; return (output, note). Kills the whole process group on timeout."""
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        note = "[exit %d]" % p.returncode if p.returncode else ""
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        out, _ = p.communicate()
+        note = "[timeout after %gs]" % timeout
+    return out.decode("utf-8", "replace"), note
+
+
+def parse_ranges(spec):
+    ranges = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        start = int(a)
+        ranges.append((start, int(b) if b else start))
+    return ranges
+
+
+def read_excerpt(item):
+    """item is PATH or PATH:START-END[,START-END]; line numbers are 1-based and inclusive."""
+    path, ranges = item, None
+    if ":" in item:
+        head, _, tail = item.rpartition(":")
+        try:
+            ranges = parse_ranges(tail)
+            path = head
+        except ValueError:
+            path, ranges = item, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        return "", "[error: %s]" % e.strerror
+    if ranges is None:
+        return "\n".join("%d\t%s" % (i, l) for i, l in enumerate(lines, 1)), ""
+    out = []
+    for start, end in ranges:
+        for i in range(max(start, 1), min(end, len(lines)) + 1):
+            out.append("%d\t%s" % (i, lines[i - 1]))
+    return "\n".join(out), ""
+
+
+def load_items(path):
+    items = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.strip() and not line.lstrip().startswith("#"):
+                items.append(line)
+    return items
+
+
+def run_item(item, timeout, head, tail):
+    label = item
+    if item.startswith("\0"):
+        label = item = item[1:]
+        out, note = read_excerpt(item)
+    else:
+        t = timeout
+        if item.startswith("@"):
+            secs, _, rest = item[1:].partition(" ")
+            try:
+                t, item = float(secs), rest
+                label = item
+            except ValueError:
+                pass
+        out, note = run_command(item, t)
+    body = cap(out, head, tail)
+    parts = ["== %s ==" % label]
+    if body:
+        parts.append(body)
+    if note:
+        parts.append(note)
+    return "\n".join(parts)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="burst", description="Run many read-only commands or file excerpts in parallel.")
+    ap.add_argument("items", nargs="*", help="shell commands, run with sh -c")
+    ap.add_argument("-f", "--file", help="read commands from FILE, one per line (# comments, @SECS prefix)")
+    ap.add_argument("--files", nargs="+", default=[], metavar="PATH[:A-B]", help="file excerpts by 1-based inclusive line ranges; takes all remaining arguments")
+    ap.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per command (default %(default)g)")
+    ap.add_argument("-H", "--head", type=int, default=DEFAULT_HEAD, help="lines kept from the start (default %(default)d)")
+    ap.add_argument("-T", "--tail", type=int, default=DEFAULT_TAIL, help="lines kept from the end (default %(default)d)")
+    ap.add_argument("-j", "--jobs", type=int, default=16, help="maximum parallel items (default %(default)d)")
+    a = ap.parse_args(argv)
+    items = list(a.items)
+    if a.file:
+        items += load_items(a.file)
+    items += ["\0" + f for f in a.files]
+    if not items:
+        ap.error("no items given")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+        results = list(ex.map(lambda i: run_item(i, a.timeout, a.head, a.tail), items))
+    print("\n".join(results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
