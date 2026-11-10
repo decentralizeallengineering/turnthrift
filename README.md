@@ -9,6 +9,23 @@ Small Claude Code tools that cut model round trips and reply length, so a sessio
 - `hooks/turn_thrift.py`: PreToolUse hook that suggests batching after several read-only calls in a row. It never blocks.
 - `hooks/brevity_stop.py`: Stop hook that asks for detail to move to a file when a reply is over a word limit.
 
+## Try it
+
+Three reads, one tool call:
+
+```console
+$ git clone https://github.com/decentralizeallengineering/turnthrift && cd turnthrift
+$ ./burst "git log --oneline -2" "ls hooks" --files README.md:1-1
+== git log --oneline -2 ==
+5839dd5 Add CI and README badges
+69722c1 Add CI: tests on Python 3.10 and 3.12
+== ls hooks ==
+brevity_stop.py
+turn_thrift.py
+== README.md:1-1 ==
+1	# turnthrift
+```
+
 ## Install
 
     cp burst enum ~/.local/bin/ && chmod +x ~/.local/bin/burst ~/.local/bin/enum
